@@ -1,0 +1,20 @@
+{
+  "name": "teacher-search-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "check": "vue-tsc -b --pretty"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "5.2.4",
+    "vite": "6.4.4",
+    "vue": "3.5.44"
+  },
+  "devDependencies": {
+    "typescript": "5.8.3",
+    "vue-tsc": "2.2.10"
+  }
+}
