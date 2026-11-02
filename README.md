@@ -29,7 +29,6 @@ npm.cmd ci
 npm.cmd run dev
 ```
 
-前端默认请求 `http://127.0.0.1:8000/api`。可设置 `VITE_API_BASE_URL` 覆盖。
 
 ## 验收
 
