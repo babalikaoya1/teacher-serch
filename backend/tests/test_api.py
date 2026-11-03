@@ -39,10 +39,12 @@ def test_import_preview_confirm_duplicate_and_filter(client):
     assert draft["source_group"] == "测试家教群"
     draft["location_lat"] = 39.9
     draft["location_lng"] = 116.4
+    draft["geocode_status"] = "resolved"
 
     first = client.post("/api/import/confirm", json={"jobs": [draft]})
     assert first.status_code == 200
     assert len(first.json()) == 1
+    assert first.json()[0]["geocode_status"] == "resolved"
     second = client.post("/api/import/confirm", json={"jobs": [draft]})
     assert second.json() == []
 
@@ -68,8 +70,111 @@ def test_import_preview_confirm_duplicate_and_filter(client):
     assert missing_origin.status_code == 400
 
 
-def test_maps_config_does_not_return_credentials(client):
+def test_maps_config_exposes_only_the_web_sdk_values(client, monkeypatch):
+    import app.map_config as map_config
+
+    monkeypatch.setattr(map_config, "MAP_WEB_SDK_URL", "https://maps.example.test/loader.js")
+    monkeypatch.setattr(map_config, "MAP_WEB_PUBLIC_KEY", "public-test-key")
     response = client.get("/api/maps/config")
     assert response.status_code == 200
-    assert "web_public_key" not in response.json()
+    assert response.json()["sdk_url"] == "https://maps.example.test/loader.js"
+    assert response.json()["public_key"] == "public-test-key"
+    assert response.json()["web_sdk_configured"] is True
     assert "server_api_key" not in response.json()
+
+
+def test_distance_filter_returns_only_orders_within_radius_and_hourly_salary(client):
+    orders = [
+        {"subject": "数学", "city": "北京市", "location": "海淀区", "teaching_mode": "线下", "salary": 150, "salary_basis": "hour", "raw_text": "近距离时薪订单"},
+        {"subject": "数学", "city": "北京", "location": "海淀区", "teaching_mode": "线下", "salary": 180, "salary_basis": "hour", "raw_text": "远距离时薪订单"},
+        {"subject": "数学", "city": "北京", "location": "海淀区", "teaching_mode": "线下", "salary": 750, "salary_basis": "week", "raw_text": "周薪订单"},
+        {"subject": "数学", "city": "北京", "location": "线上", "teaching_mode": "线上", "salary": 200, "salary_basis": "hour", "raw_text": "线上订单"},
+        {"subject": "数学", "city": "成都", "location": "市中心", "teaching_mode": "线下", "salary": 160, "salary_basis": "hour", "raw_text": "其他城市同坐标订单"},
+    ]
+    for order in orders:
+        order["location_lat"] = 39.9
+        order["location_lng"] = 116.4
+    orders[1]["location_lat"] = 39.91
+    saved = client.post("/api/import/confirm", json={"jobs": orders})
+    assert saved.status_code == 200
+
+    response = client.get("/api/jobs", params={
+        "min_salary": 100,
+        "max_distance_km": 1,
+        "origin_lat": 39.9,
+        "origin_lng": 116.4,
+        "city": "北京市",
+    })
+    assert response.status_code == 200
+    assert [job["raw_text"] for job in response.json()] == ["近距离时薪订单"]
+    assert response.json()[0]["distance_km"] == 0
+
+
+def test_existing_order_location_can_be_saved_and_used_for_distance(client):
+    draft = {"city": "北京市", "location": "海淀区", "raw_text": "旧订单，等待补坐标"}
+    saved = client.post("/api/import/confirm", json={"jobs": [draft]}).json()[0]
+    update = client.patch(f"/api/jobs/{saved['id']}/location", json={
+        "location_lat": 39.9,
+        "location_lng": 116.4,
+        "location": "海淀区某地",
+        "city": "北京",
+    })
+    assert update.status_code == 200
+    assert update.json()["location"] == "海淀区某地"
+    assert update.json()["city"] == "北京"
+
+    results = client.get("/api/jobs", params={
+        "origin_lat": 39.9,
+        "origin_lng": 116.4,
+        "max_distance_km": 0.5,
+    })
+    assert len(results.json()) == 1
+    assert results.json()[0]["distance_km"] == 0
+
+
+def test_geocoding_timeout_does_not_block_importing_orders(client):
+    orders = [
+        {"location": "海淀五棵松附近", "raw_text": "地址定位超时订单", "geocode_status": "failed"},
+        {"location": "顺义区某小区", "raw_text": "正常订单", "location_lat": 40.1, "location_lng": 116.6, "geocode_status": "resolved"},
+    ]
+    response = client.post("/api/import/confirm", json={"jobs": orders})
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+    assert response.json()[0]["geocode_status"] == "failed"
+    assert response.json()[0]["location_lat"] is None
+    assert response.json()[1]["location_lat"] == 40.1
+
+
+def test_ai_search_returns_matched_database_job(client, monkeypatch):
+    import app.main as main
+
+    async def fake_find_matching_jobs(query, jobs):
+        assert query == "順義附近的初中英語家教"
+        assert len(jobs) == 1
+        return [{"id": jobs[0]["id"], "reason": "區域、年級和科目符合"}]
+
+    monkeypatch.setattr(main, "find_matching_jobs", fake_find_matching_jobs)
+    draft = {
+        "subject": "英語",
+        "grade": "初二",
+        "location": "順義區",
+        "raw_text": "初二英語，順義區，週末上課",
+        "source_group": "測試群",
+    }
+    saved = client.post("/api/import/confirm", json={"jobs": [draft]}).json()[0]
+
+    response = client.post("/api/ai/search", json={"query": "順義附近的初中英語家教"})
+    assert response.status_code == 200
+    assert response.json()["matches"] == [{"job": saved, "reason": "區域、年級和科目符合"}]
+
+
+def test_ai_search_reports_missing_server_configuration(client, monkeypatch):
+    from app.services import ai_search
+
+    monkeypatch.setattr(ai_search, "LLM_CHAT_COMPLETIONS_URL", "")
+    monkeypatch.setattr(ai_search, "LLM_API_KEY", "")
+    monkeypatch.setattr(ai_search, "LLM_MODEL", "")
+
+    response = client.post("/api/ai/search", json={"query": "找初中英语家教"})
+    assert response.status_code == 503
+    assert "backend/.env" in response.json()["detail"]

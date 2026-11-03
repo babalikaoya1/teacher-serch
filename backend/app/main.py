@@ -2,14 +2,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from . import models
 from .database import engine, ensure_schema, get_db
+from .ai_config import public_ai_config
 from .map_config import public_map_config
-from .schemas import ImportConfirm, ImportPreview, JobOut, MapConfigOut
-from .services.distance import haversine_km
+from .schemas import AIConfigOut, AISearchRequest, AISearchResponse, ImportConfirm, ImportPreview, JobLocationUpdate, JobOut, MapConfigOut
+from .services.ai_search import AIConfigurationError, AIProviderError, find_matching_jobs
+from .services.city import normalize_city_name
+from .services.distance import batch_haversine_km, distance_bounding_box
 from .services.importer import preview_messages
 
 
@@ -36,6 +39,30 @@ def health():
 @app.get("/api/maps/config", response_model=MapConfigOut)
 def maps_config():
     return public_map_config()
+
+
+@app.get("/api/ai/config", response_model=AIConfigOut)
+def ai_config():
+    return public_ai_config()
+
+
+@app.post("/api/ai/search", response_model=AISearchResponse)
+async def ai_search(payload: AISearchRequest, db: Session = Depends(get_db)):
+    jobs = db.scalars(
+        select(models.TutoringJob)
+        .where(models.TutoringJob.status == "open")
+        .order_by(models.TutoringJob.id.desc())
+        .limit(300)
+    ).all()
+    available_jobs = [JobOut.model_validate(job).model_dump() for job in jobs]
+    try:
+        matches = await find_matching_jobs(payload.query.strip(), available_jobs)
+    except AIConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except AIProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    by_id = {job["id"]: job for job in available_jobs}
+    return {"matches": [{"job": by_id[item["id"]], "reason": item["reason"]} for item in matches]}
 
 
 @app.post("/api/import/preview", response_model=ImportPreview)
@@ -84,6 +111,7 @@ def list_jobs(
     subject: str | None = None,
     location: str | None = None,
     source_group: str | None = None,
+    city: str | None = Query(default=None, max_length=80),
     min_salary: float | None = Query(default=None, ge=0),
     max_salary: float | None = Query(default=None, ge=0),
     origin_lat: float | None = Query(default=None, ge=-90, le=90),
@@ -103,23 +131,66 @@ def list_jobs(
         query = query.where(models.TutoringJob.location.contains(location))
     if source_group:
         query = query.where(models.TutoringJob.source_group.contains(source_group))
+    city_key = normalize_city_name(city)
+    if city_key:
+        query = query.where(models.TutoringJob.city == city_key)
     if min_salary is not None:
-        query = query.where(models.TutoringJob.salary >= min_salary)
+        query = query.where(
+            models.TutoringJob.salary >= min_salary,
+            or_(models.TutoringJob.salary_basis == "hour", models.TutoringJob.salary_basis.is_(None)),
+        )
     if max_salary is not None:
-        query = query.where(models.TutoringJob.salary <= max_salary)
+        query = query.where(
+            models.TutoringJob.salary <= max_salary,
+            or_(models.TutoringJob.salary_basis == "hour", models.TutoringJob.salary_basis.is_(None)),
+        )
+    if max_distance_km is not None and origin_lat is not None and origin_lng is not None:
+        latitude_delta, longitude_delta = distance_bounding_box(origin_lat, max_distance_km)
+        query = query.where(
+            models.TutoringJob.location_lat.between(max(-90, origin_lat - latitude_delta), min(90, origin_lat + latitude_delta)),
+            or_(models.TutoringJob.teaching_mode.is_(None), ~models.TutoringJob.teaching_mode.contains("线上")),
+            or_(models.TutoringJob.location.is_(None), ~models.TutoringJob.location.contains("线上")),
+        )
+        min_lng = origin_lng - longitude_delta
+        max_lng = origin_lng + longitude_delta
+        if min_lng < -180:
+            query = query.where(or_(models.TutoringJob.location_lng >= min_lng + 360, models.TutoringJob.location_lng <= max_lng))
+        elif max_lng > 180:
+            query = query.where(or_(models.TutoringJob.location_lng >= min_lng, models.TutoringJob.location_lng <= max_lng - 360))
+        else:
+            query = query.where(models.TutoringJob.location_lng.between(min_lng, max_lng))
     jobs = db.scalars(query.order_by(models.TutoringJob.id.desc())).all()
+    distances = batch_haversine_km(origin_lat, origin_lng, jobs) if origin_lat is not None and origin_lng is not None else {}
     results = []
     for job in jobs:
         item = JobOut.model_validate(job).model_dump()
-        if origin_lat is not None and origin_lng is not None and job.location_lat is not None and job.location_lng is not None:
-            distance = haversine_km(origin_lat, origin_lng, job.location_lat, job.location_lng)
+        if job.id in distances:
+            distance = distances[job.id]
             item["distance_km"] = round(distance, 2)
-            if max_distance_km is not None and (job.teaching_mode == "线上" or distance > max_distance_km):
+            is_online = "线上" in (job.teaching_mode or "") or "线上" in (job.location or "")
+            if max_distance_km is not None and (is_online or distance > max_distance_km):
                 continue
         elif max_distance_km is not None:
             continue
         results.append(item)
     return results
+
+
+@app.patch("/api/jobs/{job_id}/location", response_model=JobOut)
+def update_job_location(job_id: int, payload: JobLocationUpdate, db: Session = Depends(get_db)):
+    job = db.get(models.TutoringJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="未找到这条家教单")
+    job.location_lat = payload.location_lat
+    job.location_lng = payload.location_lng
+    if payload.location:
+        job.location = payload.location
+    if payload.city:
+        job.city = normalize_city_name(payload.city)
+    job.geocode_status = "manual"
+    db.commit()
+    db.refresh(job)
+    return job
 
 
 @app.patch("/api/jobs/{job_id}/status", response_model=JobOut)

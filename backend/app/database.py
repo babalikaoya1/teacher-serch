@@ -25,6 +25,7 @@ def ensure_schema(bind=engine):
     existing_columns = {column["name"] for column in inspector.get_columns("tutoring_jobs")}
     additive_columns = {
         "gender": "VARCHAR(12)",
+        "city": "VARCHAR(80)",
         "teaching_mode": "VARCHAR(20)",
         "salary_basis": "VARCHAR(20)",
         "salary_is_minimum": "BOOLEAN NOT NULL DEFAULT FALSE",
@@ -40,6 +41,11 @@ def ensure_schema(bind=engine):
         with bind.begin() as connection:
             for name, definition in missing:
                 connection.exec_driver_sql(f"ALTER TABLE tutoring_jobs ADD COLUMN {name} {definition}")
+    with bind.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_tutoring_jobs_city_coordinates "
+            "ON tutoring_jobs (city, location_lat, location_lng)"
+        )
 
 
 def get_db():

@@ -13,6 +13,7 @@ class TutoringJob(Base):
     subject: Mapped[str | None] = mapped_column(String(40), index=True)
     grade: Mapped[str | None] = mapped_column(String(40))
     gender: Mapped[str | None] = mapped_column(String(12))
+    city: Mapped[str | None] = mapped_column(String(80), index=True)
     location: Mapped[str | None] = mapped_column(String(120), index=True)
     teaching_mode: Mapped[str | None] = mapped_column(String(20))
     salary: Mapped[float | None] = mapped_column(Float, index=True)
