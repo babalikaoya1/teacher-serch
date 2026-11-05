@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: teacher
+      POSTGRES_USER: teacher
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请填写数据库密码}
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U teacher -d teacher"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  api:
+    build: ../backend
+    restart: unless-stopped
+    env_file: ../backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://teacher:${POSTGRES_PASSWORD:?请填写数据库密码}@db:5432/teacher
+      APP_ENV: production
+      ALLOWED_ORIGINS: https://${APP_DOMAIN:?请填写网站域名}
+      SYNC_WORKER_ENABLED: "true"
+      WECHAT_HELPER_PACKAGE: /opt/downloads/微信同步助手.exe
+    volumes:
+      - ../desktop_helper/dist:/opt/downloads:ro
+    depends_on:
+      db:
+        condition: service_healthy
+  web:
+    build: ../frontend
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?请填写网站域名}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - certificates:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+volumes:
+  database:
+  certificates:
+  caddy_config:

@@ -30,7 +30,7 @@ def test_existing_database_gets_additive_columns_without_losing_rows(tmp_path):
         old_job = connection.execute(text("SELECT id, raw_text, salary_is_minimum, geocode_status FROM tutoring_jobs WHERE id = 1")).one()
     engine.dispose()
 
-    assert {"gender", "city", "teaching_mode", "order_code", "location_lat", "location_lng"}.issubset(columns)
+    assert {"gender", "city", "teaching_mode", "order_code", "location_lat", "location_lng", "geocode_error", "geocode_attempted_at"}.issubset(columns)
     assert "ix_tutoring_jobs_city_coordinates" in {index["name"] for index in inspect(engine).get_indexes("tutoring_jobs")}
     assert old_job.raw_text == "old order"
     assert bool(old_job.salary_is_minimum) is False

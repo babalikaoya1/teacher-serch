@@ -5,6 +5,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, get_db
 from app.main import app
+from app.services.geocoding import GeocodeResult
 
 
 @pytest.fixture
@@ -14,6 +15,12 @@ def client(tmp_path, monkeypatch):
     test_engine = create_engine(f"sqlite:///{tmp_path / 'api-test.db'}", connect_args={"check_same_thread": False})
     TestingSession = sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
     monkeypatch.setattr(main, "engine", test_engine)
+    monkeypatch.setattr(main, "SYNC_WORKER_ENABLED", False)
+
+    async def fake_geocode_address(client, address, city=None, service_key=None):
+        return GeocodeResult(error="模拟地址无结果")
+
+    monkeypatch.setattr(main, "geocode_address", fake_geocode_address)
 
     def override_get_db():
         session = TestingSession()
@@ -24,6 +31,8 @@ def client(tmp_path, monkeypatch):
 
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as test_client:
+        response = test_client.post("/api/auth/register", json={"username": "测试账号", "password": "测试专用密码123456"})
+        assert response.status_code == 201
         yield test_client
     app.dependency_overrides.clear()
     test_engine.dispose()
@@ -75,12 +84,20 @@ def test_maps_config_exposes_only_the_web_sdk_values(client, monkeypatch):
 
     monkeypatch.setattr(map_config, "MAP_WEB_SDK_URL", "https://maps.example.test/loader.js")
     monkeypatch.setattr(map_config, "MAP_WEB_PUBLIC_KEY", "public-test-key")
+    monkeypatch.setattr(map_config, "MAP_WEB_SERVICE_KEY", "private-service-test-key")
+    monkeypatch.setattr(map_config, "MAP_WEB_SECURITY_CODE", "private-security-test-code")
     response = client.get("/api/maps/config")
     assert response.status_code == 200
     assert response.json()["sdk_url"] == "https://maps.example.test/loader.js"
     assert response.json()["public_key"] == "public-test-key"
     assert response.json()["web_sdk_configured"] is True
+    assert response.json()["server_geocoding_configured"] is True
+    assert response.json()["js_security_proxy_configured"] is True
+    assert response.json()["js_service_proxy_url"] == "/api/maps/amap-service"
     assert "server_api_key" not in response.json()
+    assert "MAP_WEB_SERVICE_KEY" not in response.text
+    assert "private-service-test-key" not in response.text
+    assert "private-security-test-code" not in response.text
 
 
 def test_distance_filter_returns_only_orders_within_radius_and_hourly_salary(client):
@@ -143,6 +160,90 @@ def test_geocoding_timeout_does_not_block_importing_orders(client):
     assert response.json()[0]["geocode_status"] == "failed"
     assert response.json()[0]["location_lat"] is None
     assert response.json()[1]["location_lat"] == 40.1
+
+
+def test_import_preview_geocodes_server_side_and_distance_filter_uses_saved_coordinates(client, monkeypatch):
+    import app.main as main
+
+    async def successful_geocode(client, address, city=None, service_key=None):
+        return GeocodeResult(39.9, 116.4, "北京市", "北京市海淀区五棵松")
+
+    monkeypatch.setattr(main, "geocode_address", successful_geocode)
+    preview = client.post("/api/import/preview", data={
+        "text": "初中数学家教，周末上课，薪资 150元/小时，地址在海淀区五棵松",
+        "city": "北京市",
+    })
+    assert preview.status_code == 200
+    draft = preview.json()["jobs"][0]
+    assert draft["location_lat"] == 39.9
+    assert draft["location_lng"] == 116.4
+    assert draft["geocode_status"] == "resolved"
+
+    saved = client.post("/api/import/confirm", json={"jobs": [draft]}).json()[0]
+    assert saved["location_lat"] == 39.9
+    results = client.get("/api/jobs", params={
+        "city": "北京市", "origin_lat": 39.9, "origin_lng": 116.4, "max_distance_km": 5,
+    })
+    assert len(results.json()) == 1
+    assert results.json()[0]["distance_km"] == 0
+
+
+def test_one_failed_geocode_does_not_block_other_import_preview_orders(client, monkeypatch):
+    import app.main as main
+
+    async def mixed_geocode(client, address, city=None, service_key=None):
+        if "海淀" in address:
+            return GeocodeResult(error="模拟高德地址无结果")
+        return GeocodeResult(39.9, 116.4, "北京市", "北京市朝阳区")
+
+    monkeypatch.setattr(main, "geocode_address", mixed_geocode)
+    response = client.post("/api/import/preview", data={
+        "city": "北京市",
+        "text": "初中数学家教\n地址：海淀区五棵松\n\n初中英语家教\n地址：朝阳区望京",
+    })
+    assert response.status_code == 200
+    drafts = response.json()["jobs"]
+    assert len(drafts) == 2
+    assert [draft["geocode_status"] for draft in drafts] == ["failed", "resolved"]
+    assert "模拟高德地址无结果" in drafts[0]["geocode_error"]
+    assert drafts[1]["location_lat"] == 39.9
+
+
+def test_distance_search_backfills_existing_missing_coordinates(client, monkeypatch):
+    import app.main as main
+
+    saved = client.post("/api/import/confirm", json={"jobs": [{
+        "city": "北京市", "location": "海淀五棵松附近", "raw_text": "历史订单待补坐标",
+    }]}).json()[0]
+    async def successful_geocode(client, address, city=None, service_key=None):
+        assert city == "北京市" or city == "北京"
+        return GeocodeResult(39.9, 116.4, "北京市", "北京市海淀区五棵松")
+
+    monkeypatch.setattr(main, "geocode_address", successful_geocode)
+    backfill = client.post("/api/jobs/geocode-missing", params={"city": "北京市"})
+    assert backfill.status_code == 200
+    assert backfill.json()["resolved"] == 1
+    filtered = client.get("/api/jobs", params={
+        "city": "北京市", "origin_lat": 39.9, "origin_lng": 116.4, "max_distance_km": 5,
+    })
+    assert [job["id"] for job in filtered.json()] == [saved["id"]]
+
+
+def test_orders_are_appended_and_expired_orders_are_deleted_with_notice(client):
+    first = client.post("/api/import/confirm", json={"jobs": [{"raw_text": "第一条独立订单"}]}).json()
+    second = client.post("/api/import/confirm", json={"jobs": [{"raw_text": "第二条独立订单"}]}).json()
+    assert first[0]["id"] != second[0]["id"]
+    assert first[0]["created_at"]
+
+    import app.main as main
+    from sqlalchemy import text
+
+    with main.engine.begin() as connection:
+        connection.execute(text("UPDATE tutoring_jobs SET created_at = datetime('now', '-4 days') WHERE id = :job_id"), {"job_id": first[0]["id"]})
+    response = client.get("/api/jobs")
+    assert response.status_code == 200
+    assert response.headers["X-Expired-Jobs-Deleted"] == "1"
+    assert [job["raw_text"] for job in response.json()] == ["第二条独立订单"]
 
 
 def test_ai_search_returns_matched_database_job(client, monkeypatch):

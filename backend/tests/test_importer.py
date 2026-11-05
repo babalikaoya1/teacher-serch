@@ -62,3 +62,40 @@ def test_multiline_online_order_parses_starting_hourly_rate():
     assert jobs[0]["salary_basis"] == "hour"
     assert jobs[0]["salary_is_minimum"] is True
     assert jobs[0]["order_code"] == "LXR签-瑞丰"
+
+
+def test_concatenated_orders_split_without_blank_lines_and_extract_address_gender_salary():
+    sample = """A 80903 T
+门头沟九龙东苑
+六年级数学
+男孩儿
+每周1次，2h（周一晚6:30-8:30）
+时薪500/2h
+WH0710041
+西城马连道常青藤嘉园
+初二物理
+女孩儿
+每周2次，2h/次（周中晚7-9）
+时薪300+/h
+A 26033101
+朝阳门豆瓣小区
+初一数学英语
+男孩儿
+每周1次，2h（周日上午）
+时薪300/h
+25113001
+东三环世贸公园
+初二物理
+女孩儿
+每周1次，2h（周日上午）
+时薪300/h"""
+    jobs, ignored = preview_messages(sample)
+
+    assert ignored == 0
+    assert len(jobs) == 4
+    assert [job["location"] for job in jobs] == ["门头沟九龙东苑", "西城马连道常青藤嘉园", "朝阳门豆瓣小区", "东三环世贸公园"]
+    assert [job["gender"] for job in jobs] == ["男", "女", "男", "女"]
+    assert jobs[0]["salary"] == 500
+    assert jobs[0]["salary_basis"] == "session"
+    assert jobs[1]["salary_is_minimum"] is True
+    assert [job["order_code"] for job in jobs] == ["A 80903 T", "WH0710041", "A 26033101", "25113001"]

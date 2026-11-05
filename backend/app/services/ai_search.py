@@ -1,5 +1,6 @@
 import json
 import re
+from typing import Any
 
 import httpx
 
@@ -12,6 +13,122 @@ class AIConfigurationError(Exception):
 
 class AIProviderError(Exception):
     pass
+
+
+MAX_AI_CANDIDATES = 30
+
+_SUBJECTS = ("语文", "数学", "英语", "物理", "化学", "生物", "历史", "地理", "政治", "科学", "编程", "钢琴", "美术")
+_GRADE_GROUPS = {
+    "小学": ("小学", "一年级", "二年级", "三年级", "四年级", "五年级", "六年级", "1年级", "2年级", "3年级", "4年级", "5年级", "6年级"),
+    "初中": ("初中", "初一", "初二", "初三", "七年级", "八年级", "九年级"),
+    "高中": ("高中", "高一", "高二", "高三"),
+}
+_PREFERENCE_TERMS = ("有经验", "经验丰富", "耐心", "细心", "责任心", "专职", "清北", "男女不限")
+_STOP_TERMS = ("附近", "周边", "想找", "帮我找", "找一份", "找个", "家教", "老师", "订单", "优先", "最好", "希望", "需要", "要求", "上课", "授课", "一份", "一个")
+
+
+def _query_criteria(query: str) -> dict[str, Any]:
+    subjects = [subject for subject in _SUBJECTS if subject in query]
+    grade_groups = [name for name, terms in _GRADE_GROUPS.items() if any(term in query for term in terms)]
+    locations = [match.group(1) for match in re.finditer(r"([\u4e00-\u9fff]{2,8})(?:附近|周边)", query)]
+    locations.extend(match.group(1) for match in re.finditer(r"([\u4e00-\u9fff]{2,8}(?:区|县|市))", query))
+    locations = list(dict.fromkeys(locations))
+
+    salary_match = re.search(
+        r"(?:時薪|时薪|每小时|小时|元\s*/\s*(?:小时|h))?\s*(\d+(?:\.\d+)?)\s*(?:元\s*)?(?:以上|起|及以上|不低于|至少|\+|>=)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    salary_basis = None
+    if any(term in query.lower() for term in ("时薪", "每小时", "/小时", "/h", "小时")):
+        salary_basis = "hour"
+    elif any(term in query for term in ("周薪", "每周")):
+        salary_basis = "week"
+    elif "按次" in query:
+        salary_basis = "session"
+
+    return {
+        "subjects": subjects,
+        "grades": grade_groups,
+        "locations": locations,
+        "minimum_salary": float(salary_match.group(1)) if salary_match else None,
+        "salary_basis": salary_basis,
+        "weekend": any(term in query for term in ("周末", "周六", "周日", "星期六", "星期日", "星期天")),
+    }
+
+
+def _candidate_text(job: dict[str, Any]) -> str:
+    return " ".join(
+        str(job.get(field) or "")
+        for field in ("subject", "grade", "city", "location", "teaching_mode", "salary_basis", "salary_unit", "schedule", "requirements", "student_notes")
+    ).lower()
+
+
+def _normalize_place(value: str) -> str:
+    return re.sub(r"市|区|县|地区|自治州|盟|旗", "", value).lower()
+
+
+def select_candidate_jobs(query: str, jobs: list[dict], limit: int = MAX_AI_CANDIDATES) -> list[dict]:
+    """先按可识别的明确条件筛选，再按可读字段相关度排序。"""
+    criteria = _query_criteria(query)
+    ranked: list[tuple[int, int, dict]] = []
+    strict_candidates: list[tuple[int, int, dict]] = []
+
+    for index, job in enumerate(jobs):
+        text = _candidate_text(job)
+        subject = str(job.get("subject") or "").lower()
+        grade = str(job.get("grade") or "").lower()
+        place = _normalize_place(f"{job.get('city') or ''} {job.get('location') or ''}")
+        schedule = str(job.get("schedule") or "").lower()
+        score = 0
+        strict_match = True
+
+        for term in criteria["subjects"]:
+            if subject and term not in subject:
+                strict_match = False
+            if term in text:
+                score += 5
+        for group in criteria["grades"]:
+            terms = _GRADE_GROUPS[group]
+            if grade and not any(term.lower() in grade for term in terms):
+                score -= 4
+            elif grade:
+                score += 3
+        for location in criteria["locations"]:
+            normalized_location = _normalize_place(location)
+            if place and normalized_location not in place:
+                strict_match = False
+            if normalized_location in place:
+                score += 5
+        if criteria["minimum_salary"] is not None and job.get("salary") is not None:
+            requested_basis = criteria["salary_basis"]
+            actual_basis = job.get("salary_basis")
+            if requested_basis and actual_basis and requested_basis != actual_basis:
+                strict_match = False
+            elif float(job["salary"]) < criteria["minimum_salary"]:
+                strict_match = False
+            else:
+                score += 4
+        if criteria["weekend"]:
+            if any(term in schedule for term in ("周末", "周六", "周日", "星期六", "星期日", "星期天")):
+                score += 3
+            elif schedule:
+                score -= 2
+        for term in _PREFERENCE_TERMS:
+            if term in query and term in text:
+                score += 2
+
+        for token in re.findall(r"[a-zA-Z]{2,}|\d{2,}", query.lower()):
+            if token in text:
+                score += 1
+        ranked.append((score, index, job))
+        if strict_match:
+            strict_candidates.append((score, index, job))
+
+    # 明确条件有结果时遵从条件；完全无命中时放宽筛选，交由模型判断不完整或模糊字段。
+    pool = strict_candidates or ranked
+    pool.sort(key=lambda item: (-item[0], -int(item[2].get("id") or 0), item[1]))
+    return [item[2] for item in pool[:max(1, limit)]]
 
 
 def normalize_chat_completions_url(configured_url: str) -> str:
@@ -59,17 +176,18 @@ async def find_matching_jobs(query: str, jobs: list[dict]) -> list[dict]:
     job_list = [
         {
             "id": job["id"],
-            "科目": job.get("subject"),
-            "年级": job.get("grade"),
-            "地点": job.get("location"),
-            "授课方式": job.get("teaching_mode"),
+            "科目": str(job.get("subject") or "")[:120],
+            "年级": str(job.get("grade") or "")[:80],
+            "城市": str(job.get("city") or "")[:80],
+            "地点": str(job.get("location") or "")[:120],
+            "授课方式": str(job.get("teaching_mode") or "")[:40],
             "薪资": job.get("salary"),
-            "薪资口径": job.get("salary_basis"),
-            "时间": job.get("schedule"),
-            "要求": job.get("requirements"),
-            "原始订单": job.get("raw_text"),
+            "薪资口径": str(job.get("salary_basis") or "")[:40],
+            "时间": str(job.get("schedule") or "")[:240],
+            "学生情况": str(job.get("student_notes") or "")[:240],
+            "教员要求": str(job.get("requirements") or "")[:240],
         }
-        for job in jobs
+        for job in jobs[:MAX_AI_CANDIDATES]
     ]
     request_body = {
         "model": LLM_MODEL,
@@ -124,6 +242,8 @@ async def find_matching_jobs(query: str, jobs: list[dict]) -> list[dict]:
         raise AIProviderError(detail) from exc
     except httpx.TimeoutException as exc:
         raise AIProviderError("大模型请求超时，请检查服务商响应状态或适当延长 LLM_TIMEOUT_SECONDS。") from exc
+    except httpx.ConnectError as exc:
+        raise AIProviderError("无法连接大模型服务，请核对接口地址、网络连通性及 TLS 配置。") from exc
     except httpx.RequestError as exc:
         raise AIProviderError("无法连接大模型服务，请核对接口域名、网络和 TLS 配置。") from exc
     except (KeyError, IndexError, TypeError, ValueError) as exc:

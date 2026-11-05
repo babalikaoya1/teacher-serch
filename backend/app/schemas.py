@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -23,6 +24,8 @@ class JobDraft(BaseModel):
     location_lat: float | None = Field(default=None, ge=-90, le=90)
     location_lng: float | None = Field(default=None, ge=-180, le=180)
     geocode_status: Literal["pending", "resolved", "manual", "failed"] = "pending"
+    geocode_error: str | None = Field(default=None, max_length=240)
+    geocode_attempted_at: datetime | None = None
     raw_text: str = Field(min_length=1, max_length=10000)
     source_group: str | None = None
 
@@ -45,8 +48,24 @@ class MapConfigOut(BaseModel):
     public_key: str | None = None
     web_sdk_configured: bool
     geocoding_api_configured: bool
+    server_geocoding_configured: bool = False
+    js_security_proxy_configured: bool = False
+    js_service_proxy_url: str | None = None
     routing_api_configured: bool
     provider_name: str | None = None
+
+
+class GeocodeRequest(BaseModel):
+    address: str = Field(min_length=1, max_length=240)
+    city: str | None = Field(default=None, max_length=80)
+
+
+class GeocodeResponse(BaseModel):
+    location_lat: float | None = None
+    location_lng: float | None = None
+    city: str | None = None
+    geocode_status: Literal["resolved", "failed"]
+    geocode_error: str | None = None
 
 
 class AIConfigOut(BaseModel):
@@ -82,6 +101,8 @@ class JobOut(JobDraft):
     id: int
     status: str
     distance_km: float | None = None
+    created_at: datetime
+    published_at: datetime | None = None
 
 
 class AIMatch(BaseModel):
@@ -94,4 +115,4 @@ class AISearchResponse(BaseModel):
 
 
 class ImportConfirm(BaseModel):
-    jobs: list[JobDraft]
+    jobs: list[JobDraft] = Field(max_length=100)

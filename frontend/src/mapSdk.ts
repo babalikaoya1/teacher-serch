@@ -47,13 +47,15 @@ export type AMapApi = {
 declare global {
   interface Window {
     AMapLoader?: { load(options: { key: string; version: string; plugins: string[] }): Promise<AMapApi> }
+    _AMapSecurityConfig?: { serviceHost: string }
   }
 }
 
 let sdkPromise: Promise<AMapApi> | null = null
 
-export function loadAmapSdk(sdkUrl: string, publicKey: string): Promise<AMapApi> {
+export function loadAmapSdk(sdkUrl: string, publicKey: string, serviceProxyUrl?: string | null): Promise<AMapApi> {
   if (!sdkPromise) {
+    if (serviceProxyUrl) window._AMapSecurityConfig = { serviceHost: serviceProxyUrl }
     sdkPromise = new Promise<void>((resolve, reject) => {
       const script = document.createElement('script')
       script.src = sdkUrl

@@ -12,6 +12,8 @@ HOURLY_RE = re.compile(
 )
 WEEKLY_RE = re.compile(r"周薪\s*[#￥¥:]?\s*(?P<amount>\d+(?:\.\d+)?)")
 SESSION_RE = re.compile(r"(?P<amount>\d+(?:\.\d+)?)\s*元\s*[/／]\s*次")
+PER_SESSION_DURATION_RE = re.compile(r"(?P<amount>\d+(?:\.\d+)?)\s*元?\s*[/／]\s*(?P<hours>\d+(?:\.\d+)?)\s*h", re.IGNORECASE)
+ORDER_BOUNDARY_RE = re.compile(r"^\s*(?:[A-Z]{1,6}\s*)?\d{5,}(?:\s+[A-Z])?\s*$", re.IGNORECASE)
 
 
 def _split_blocks(content: str) -> list[list[str]]:
@@ -29,7 +31,7 @@ def _split_blocks(content: str) -> list[list[str]]:
         if not stripped:
             finish()
             continue
-        if current and (HEADER_RE.match(stripped) or re.match(r"^【\s*编号\s*】", stripped)):
+        if current and (HEADER_RE.match(stripped) or re.match(r"^【\s*编号\s*】", stripped) or ORDER_BOUNDARY_RE.match(stripped)):
             finish()
         elif current and (HOURLY_RE.search("\n".join(current)) or WEEKLY_RE.search("\n".join(current))) and not STRUCTURED_LINE_RE.match(stripped) and not stripped.startswith(("🌸", "⭐", "✨")) and not CODE_RE.search(stripped):
             finish()
@@ -64,6 +66,10 @@ def _parse_salary(text: str) -> tuple[float | None, str | None, str | None, bool
     if weekly:
         return float(weekly.group("amount")), "周薪", "week", False
 
+    per_session = PER_SESSION_DURATION_RE.search(text)
+    if per_session:
+        return float(per_session.group("amount")), f"元/{per_session.group('hours')}小时", "session", False
+
     session = SESSION_RE.search(text)
     if session:
         return float(session.group("amount")), "元/次", "session", False
@@ -74,7 +80,7 @@ def _parse_salary(text: str) -> tuple[float | None, str | None, str | None, bool
 def parse_message(block: str, source_group: str | None = None) -> dict | None:
     lines = [line.strip() for line in block.splitlines() if line.strip()]
     text = "\n".join(lines)
-    if not lines or not any(hint in text for hint in JOB_HINTS):
+    if not lines or not (any(hint in text for hint in JOB_HINTS) or any(subject in text for subject in SUBJECTS)):
         return None
 
     headline = lines[0]
@@ -86,6 +92,12 @@ def parse_message(block: str, source_group: str | None = None) -> dict | None:
     if location is None:
         region_match = re.search(r"([一-龥]{2,10}(?:区|县|市))\s*(?:线上|线下)?\s*家教", headline)
         location = region_match.group(1) if region_match else None
+    if location is None and not mode:
+        for line in lines:
+            candidate = re.sub(r"^[#＃\s]+", "", line)
+            if re.search(r"(?:区|县|镇|街道|苑|园|小区|大厦|公园|东苑|嘉园|花园)$", candidate) and len(candidate) <= 40 and not any(subject in candidate for subject in SUBJECTS):
+                location = candidate
+                break
     if location and location in ("线上", "网课"):
         mode = "线上"
 
@@ -104,8 +116,12 @@ def parse_message(block: str, source_group: str | None = None) -> dict | None:
     elif grade_match:
         grade = grade_match.group(1)
     if grade_value:
-        gender_match = re.search(r"(男|女)(?:生)?(?:\s|$|[,，])", grade_value)
+        gender_match = re.search(r"(男|女)(?:孩儿|孩|生)?(?:\s|$|[,，])", grade_value)
         gender = gender_match.group(1) if gender_match else None
+    if gender is None:
+        gender_match = re.search(r"(?:^|\n)\s*(男孩儿|女孩儿|男生|女生|男孩|女孩)\s*(?:\n|$)", text)
+        if gender_match:
+            gender = "男" if gender_match.group(1).startswith("男") else "女"
 
     schedule = _label_value(lines, ("时间安排", "课次", "上课时间"))
     if schedule is None:
@@ -116,7 +132,8 @@ def parse_message(block: str, source_group: str | None = None) -> dict | None:
     order_code = _label_value(lines, ("编号", "订单编号"))
     if order_code is None:
         code_match = CODE_RE.search(text)
-        order_code = code_match.group(1) if code_match else None
+        loose_code = ORDER_BOUNDARY_RE.match(headline)
+        order_code = code_match.group(1) if code_match else (headline.strip() if loose_code else None)
 
     student_notes = _label_value(lines, ("学员情况", "学生情况"))
     requirements = _label_value(lines, ("教员要求", "要求"))

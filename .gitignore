@@ -9,3 +9,7 @@ dist/
 .env
 .env.local
 .env.*.local
+desktop_helper/build/
+desktop_helper/*.spec
+deploy/backups/
+deploy/legacy/
